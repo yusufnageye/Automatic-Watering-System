@@ -1,24 +1,170 @@
-# Compiled class file
-*.class
+import org.firmata4j.firmata.*;
+import org.firmata4j.IODevice;
+import org.firmata4j.Pin;
 
-# Log file
-*.log
+import java.io.IOException;
+import java.text.DateFormat;
+import java.text.SimpleDateFormat;
+import java.util.Calendar;
+import java.util.Date;
+import org.firmata4j.ssd1306.MonochromeCanvas;
+import org.firmata4j.ssd1306.SSD1306;
+import org.firmata4j.I2CDevice;
 
-# BlueJ files
-*.ctxt
+public class Watering {
+    static String recLog = "";
+    static volatile int moistureLevel = 0;
+    static long lastCheckTime = 0;
+    static final long HOUR_IN_MILLIS = 3600000; // 1 hour in milliseconds
+    static boolean wateringInProgress = false;
+    static long totalPumpingDuration = 0;
+    static int moistureThreshold = 500; // Your threshold value for moisture level
 
-# Mobile Tools for Java (J2ME)
-.mtj.tmp/
+    public static void process() throws IOException {
+        String myPort = "/dev/cu.usbserial-0001";
+        IODevice myGroveBoard = new FirmataDevice(myPort);
+        Date Now;
+        // 24 hour clock system
+        DateFormat dateFormat = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+        Now = Calendar.getInstance().getTime();
+        recLog = dateFormat.format(Now) + " Starting the watering process.\n";
 
-# Package Files #
-*.jar
-*.war
-*.nar
-*.ear
-*.zip
-*.tar.gz
-*.rar
+        try {
+            myGroveBoard.start();
+            System.out.println("Arduino Board Started for Watering Process.");
+            // Move the initialization check here
+            myGroveBoard.ensureInitializationIsDone();
+        } catch (Exception ex) {
+            System.out.println("Couldn't connect to the Arduino board.");
+        }
 
-# virtual machine crash logs, see http://www.java.com/en/download/help/error_hotspot.xml
-hs_err_pid*
-replay_pid*
+        var MoistVolt = myGroveBoard.getPin(16);
+        MoistVolt.setMode(Pin.Mode.ANALOG);
+        var myPump = myGroveBoard.getPin(7);
+        myPump.setMode(Pin.Mode.OUTPUT);
+
+        //  OLED Display
+        I2CDevice i2cObject = myGroveBoard.getI2CDevice((byte) 0x3C);
+        SSD1306 oLED = new SSD1306(i2cObject, SSD1306.Size.SSD1306_128_64);
+        oLED.init();
+        MonochromeCanvas canvas = oLED.getCanvas();
+        canvas.setTextsize(2);
+
+        while (true) {
+            Now = Calendar.getInstance().getTime();
+            moistureLevel = (int) MoistVolt.getValue();
+
+            // Calculate time elapsed since the last check
+            long currentTime = Now.getTime();
+            long timeElapsed = currentTime - lastCheckTime;
+
+            // Perform actions only if an hour has passed since the last check
+            if (timeElapsed >= HOUR_IN_MILLIS) {
+                lastCheckTime = currentTime; // Update the lastCheckTime
+
+                // Log the moisture level, date, and time during the hourly check
+                String pumpingStatus = (moistureLevel > moistureThreshold) ? "PW" : "NPW";
+                String moistureInfo = "M:" + moistureLevel + " " + pumpingStatus;
+                String timeInfo = dateFormat.format(Now);
+
+                // Display moisture level, pumping status, time, and date on console during the hourly check
+                if (moistureLevel > moistureThreshold) {
+                    System.out.println(timeInfo + " " + moistureInfo + " watering would start in 1 second");
+                } else {
+                    System.out.println(timeInfo + " " + moistureInfo + " No watering is needed");
+                }
+
+                // Display moisture level, pumping status, time, and date on OLED during the hourly check
+                canvas.clear();
+                canvas.drawString(0, 0, moistureInfo);
+                canvas.drawString(0, 18, timeInfo);
+                oLED.display();
+
+                // Watering process
+                if (moistureLevel > moistureThreshold) {
+                    recLog = recLog + dateFormat.format(Now) + " The moisture level is low, watering...\n";
+                    myPump.setValue(1);
+                    wateringInProgress = true;
+
+                    long startPumpTime = System.currentTimeMillis(); // Start time for pumping
+                    long previousPumpTime = startPumpTime; // For tracking 1 second intervals
+                    long currentPumpingDuration = 0; // Duration of current pumping session
+
+                    while (moistureLevel > moistureThreshold) {
+                        // Continue pumping water until the moisture level goes below the threshold (650)
+                        moistureLevel = (int) MoistVolt.getValue();
+                        long currentTimePumping = System.currentTimeMillis();
+                        if ((currentTimePumping - previousPumpTime) >= 1000) {
+                            // Print "pumping for 1 second" every second along with the current time
+                            System.out.println(new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date()) + " pumping for 1 second");
+                            previousPumpTime = currentTimePumping;
+                            currentPumpingDuration += 1000; // Add 1 second to the current pumping duration
+                        }
+                    }
+
+                    myPump.setValue(0);
+                    recLog = recLog + dateFormat.format(Now) + " The moisture level is now sufficient.\n";
+                    wateringInProgress = false;
+
+                    // Total duration
+                    totalPumpingDuration += currentPumpingDuration;
+
+                    // Print "total duration" along with the current time
+                    System.out.println(new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date()) + " Total Duration: " + totalPumpingDuration / 1000 + " seconds");
+
+                    // Call the function to update OLED display after watering is done
+                    updateOLEDAfterWatering(oLED, canvas, dateFormat, Now, moistureLevel);
+                } else {
+                    // No watering needed; below the threshold
+                    recLog = recLog + dateFormat.format(Now) + " No watering needed; below the threshold: " + moistureLevel + " " + pumpingStatus + "\n";
+                    // Call the function to update OLED display after hourly check
+                    updateOLEDAfterWatering(oLED, canvas, dateFormat, Now, moistureLevel);
+                }
+            }
+
+            // Wait for a short duration before checking again
+            try {
+                Thread.sleep(1000); // 1 second
+            } catch (InterruptedException ex) {
+                System.out.println("Watering thread interrupted.");
+            }
+        }
+    }
+
+    // update OLED display after the watering process is done
+    public static void updateOLEDAfterWatering(SSD1306 oLED, MonochromeCanvas canvas, DateFormat dateFormat, Date Now, int moistureLevel) {
+        // Determine the pumping status based on the given moisture level and threshold
+        String pumpingStatus = (moistureLevel > moistureThreshold) ? "PW" : "NPW";
+
+        // Display moisture level and time on OLED after the watering process is done
+        String moistureInfo = "M:" + moistureLevel + " " + pumpingStatus;
+        String timeInfo = dateFormat.format(Now);
+
+        canvas.clear();
+        canvas.drawString(0, 0, moistureInfo);
+        canvas.drawString(0, 18, timeInfo);
+        oLED.display();
+    }
+
+    public static String processLog() {
+        return recLog;
+    }
+
+    public static void main(String[] args) {
+        try {
+            process();
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+}
+
+import java.io.IOException;
+
+public class Minor {
+    public static void main(String[] args) throws IOException {
+        Watering.process();
+        System.out.println(Watering.processLog());
+    }
+}
+
